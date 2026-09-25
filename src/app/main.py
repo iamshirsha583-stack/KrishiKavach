@@ -2,24 +2,35 @@
 KrishiKavach FastAPI Application Server.
 
 Main API server providing:
-1. POST /api/v1/scan-trigger:
-   - Full orchestration: Geospatial ingestion -> Siamese Vision inference -> Risk assessment -> Gemini advisory -> Twilio SMS dispatch.
-   - Returns flooded_hectares, risk_level, advisory_sms, and sms_sid.
-2. GET /api/v1/maps/overlay/{village_id}:
-   - Returns GeoJSON FeatureCollection containing village boundary polygon and flood inundation extent for MapLibre GL JS.
-3. CORS middleware configured for frontend integration.
+1. Lifespan lifecycle hooks to start and stop APScheduler.
+2. Auth0 JWT security protection on critical endpoints.
+3. POST /api/v1/scan/trigger (Protected by Auth0): Accepts a bounding box, village ID, and phone number,
+   and delegates the end-to-end pipeline (GEE -> PyTorch with Lock -> GeoPandas -> Alert Gateway)
+   to FastAPI BackgroundTasks.
+4. POST /api/v1/scan-trigger (Synchronous) & GET /api/v1/maps/overlay/{village_id} (MapLibre GeoJSON).
+5. CORS middleware enabled for frontend integration.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from src.app.core.auth import get_current_user, verify_jwt_token
+from src.app.core.scheduler import (
+    PipelineExecutionResult,
+    execute_pipeline,
+    shutdown_scheduler,
+    start_scheduler,
+)
 from src.app.pipeline.geospatial.ingestion import (
     GeospatialIngestionPipeline,
     extract_village_bbox,
@@ -38,22 +49,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("KrishiKavach.API")
 
-# Initialize FastAPI App
+
+# =============================================================================
+# 1. FastAPI Lifespan Lifecycle Hook (Scheduler Management)
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager to start the background scheduler on startup and stop on shutdown."""
+    logger.info("Initializing KrishiKavach background scheduler service...")
+    start_scheduler()
+    yield
+    logger.info("Shutting down KrishiKavach background scheduler service...")
+    shutdown_scheduler()
+
+
+# Initialize FastAPI App with Lifespan
 app = FastAPI(
     title="KrishiKavach API",
     description="AI-driven Satellite Geospatial Inundation Monitoring & Agricultural Disaster Advisory Engine",
-    version="1.0.0",
+    version="2.0.0",
+    lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
 # =============================================================================
-# 3. CORS Middleware for Frontend & MapLibre Integration
+# 2. CORS Middleware for Frontend & MapLibre Integration
 # =============================================================================
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for local dev and web clients
+    allow_origins=["*"],  # Allows all origins for frontend & map clients
     allow_credentials=True,
     allow_methods=["*"],  # Allows all HTTP methods (GET, POST, OPTIONS, etc.)
     allow_headers=["*"],  # Allows all headers
@@ -69,7 +96,12 @@ ingestion_pipeline = GeospatialIngestionPipeline()
 # Request & Response Schemas
 # =============================================================================
 
-class ScanTriggerRequest(BaseModel):
+class AsyncScanTriggerRequest(BaseModel):
+    bbox: Optional[List[float]] = Field(
+        default=[85.82, 20.46, 85.87, 20.51],
+        description="Bounding box coordinates [minx, miny, maxx, maxy] in EPSG:4326",
+        example=[85.8200, 20.4600, 85.8700, 20.5100]
+    )
     village_id: str = Field(
         default="VILLAGE_001",
         description="Unique identifier of the village grid (e.g., VILLAGE_001, Rampur, DEMO_VILLAGE)",
@@ -77,12 +109,45 @@ class ScanTriggerRequest(BaseModel):
     )
     phone_number: str = Field(
         default="+919876543210",
-        description="Recipient mobile number in E.164 format for SMS advisory dispatch",
+        description="Recipient mobile number in E.164 format for SMS and Voice alert dispatch",
         example="+919876543210"
     )
     language: str = Field(
         default="Bengali",
         description="Advisory language (e.g. Bengali, Odia, Hindi, Telugu, English)",
+        example="Bengali"
+    )
+    audio_url: str = Field(
+        default="https://krishikavach.org/cache/alert.mp3",
+        description="Public URL for streaming the synthesized ElevenLabs MP3 via Twilio Voice TwiML",
+        example="https://krishikavach.org/cache/alert.mp3"
+    )
+
+
+class AsyncScanTriggerResponse(BaseModel):
+    status: str = Field(default="queued", example="queued")
+    job_id: str = Field(..., example="job_e814a1c5d79b")
+    message: str = Field(..., example="Pipeline execution successfully queued in background.")
+    village_id: str = Field(..., example="VILLAGE_001")
+    bbox: List[float] = Field(..., example=[85.82, 20.46, 85.87, 20.51])
+    submitted_at: str = Field(...)
+    auth_user: Optional[str] = Field(default=None, example="auth0|admin_user")
+
+
+class ScanTriggerRequest(BaseModel):
+    village_id: str = Field(
+        default="VILLAGE_001",
+        description="Unique identifier of the village grid",
+        example="VILLAGE_001"
+    )
+    phone_number: str = Field(
+        default="+919876543210",
+        description="Recipient mobile number in E.164 format",
+        example="+919876543210"
+    )
+    language: str = Field(
+        default="Bengali",
+        description="Advisory language (e.g. Bengali, Odia, Hindi)",
         example="Bengali"
     )
 
@@ -93,7 +158,7 @@ class ScanTriggerResponse(BaseModel):
     flooded_hectares: float = Field(..., example=142.5)
     flood_percentage: float = Field(..., example=27.8)
     risk_level: str = Field(..., example="Severe")
-    advisory_sms: str = Field(..., example="কৃষিকবচ সতর্কতা: জমি জলমগ্ন...")
+    advisory_sms: str = Field(..., example="জরুরি সতর্কতা: জমি প্লাবিত...")
     sms_sid: str = Field(..., example="SM9b87a213e4f50123456789abcdef0123")
     pipeline_details: Dict[str, Any] = Field(default_factory=dict)
 
@@ -101,7 +166,8 @@ class ScanTriggerResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "healthy"
     service: str = "KrishiKavach API"
-    version: str = "1.0.0"
+    version: str = "2.0.0"
+    scheduler_running: bool = True
 
 
 # =============================================================================
@@ -113,10 +179,12 @@ async def root_info() -> Dict[str, Any]:
     """Root metadata and system status."""
     return {
         "service": "KrishiKavach Agricultural Disaster Advisory API",
+        "version": "2.0.0",
         "status": "online",
         "docs": "/docs",
         "endpoints": {
-            "scan_trigger": "POST /api/v1/scan-trigger",
+            "async_scan_trigger": "POST /api/v1/scan/trigger (Auth0 Protected)",
+            "sync_scan_trigger": "POST /api/v1/scan-trigger",
             "map_overlay": "GET /api/v1/maps/overlay/{village_id}",
             "health": "GET /health",
         },
@@ -126,11 +194,67 @@ async def root_info() -> Dict[str, Any]:
 @app.get("/health", response_model=HealthResponse, tags=["General"])
 async def health_check() -> HealthResponse:
     """Service health check endpoint."""
-    return HealthResponse()
+    return HealthResponse(
+        status="healthy",
+        service="KrishiKavach API",
+        version="2.0.0",
+        scheduler_running=True,
+    )
 
 
 # -----------------------------------------------------------------------------
-# 1. POST /api/v1/scan-trigger
+# 3. POST /api/v1/scan/trigger (Protected by Auth0 JWT + BackgroundTasks)
+# -----------------------------------------------------------------------------
+
+@app.post(
+    "/api/v1/scan/trigger",
+    response_model=AsyncScanTriggerResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Disaster Scan & Advisory"],
+    summary="Trigger end-to-end background pipeline with bounding box (Auth0 Protected)"
+)
+async def trigger_background_scan(
+    payload: AsyncScanTriggerRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> AsyncScanTriggerResponse:
+    """
+    Accepts bounding box coordinates, verifies Auth0 JWT authentication, and delegates the
+    full multi-stage pipeline (GEE Ingestion -> PyTorch Lock Inference -> GeoPandas -> Alert Gateway)
+    to FastAPI BackgroundTasks.
+    """
+    user_id = current_user.get("sub", "anonymous")
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    logger.info(
+        f"[Auth0 Authenticated: {user_id}] Enqueueing background pipeline job '{job_id}' "
+        f"for village '{payload.village_id}', BBox: {payload.bbox}"
+    )
+
+    # Add execute_pipeline task to FastAPI background tasks
+    background_tasks.add_task(
+        execute_pipeline,
+        bbox=payload.bbox,
+        village_id=payload.village_id,
+        phone_number=payload.phone_number,
+        language=payload.language,
+        audio_url=payload.audio_url,
+    )
+
+    return AsyncScanTriggerResponse(
+        status="queued",
+        job_id=job_id,
+        message="Pipeline execution successfully enqueued in background tasks.",
+        village_id=payload.village_id,
+        bbox=payload.bbox or [85.82, 20.46, 85.87, 20.51],
+        submitted_at=now_iso,
+        auth_user=user_id,
+    )
+
+
+# -----------------------------------------------------------------------------
+# 4. POST /api/v1/scan-trigger (Synchronous Pipeline Execution)
 # -----------------------------------------------------------------------------
 
 @app.post(
@@ -138,83 +262,34 @@ async def health_check() -> HealthResponse:
     response_model=ScanTriggerResponse,
     status_code=status.HTTP_200_OK,
     tags=["Disaster Scan & Advisory"],
-    summary="Execute bi-temporal flood scan, risk calculation, AI advisory synthesis, and SMS alert dispatch"
+    summary="Execute bi-temporal flood scan synchronously and return results immediately"
 )
 async def scan_trigger(payload: ScanTriggerRequest) -> ScanTriggerResponse:
     """
-    Executes the end-to-end KrishiKavach disaster assessment pipeline:
-    1. **Geospatial Ingestion**: Reads village boundaries and loads paired T1/T2 Sentinel-2 rasters (512x512).
-    2. **Vision Inference**: Runs Siamese feature-difference / NDWI spectral analysis to calculate flooded area.
-    3. **Risk Assessment**: Computes flood severity tier and PMFBY claim priority.
-    4. **Gemini Advisory Synthesis**: Synthesizes localized agricultural recovery guidelines in the chosen language.
-    5. **Twilio SMS Dispatch**: Sends actionable alerts to the target mobile number.
+    Executes the synchronous KrishiKavach disaster assessment pipeline.
     """
-    logger.info(
-        f"Received scan trigger request for village '{payload.village_id}', "
-        f"phone '{payload.phone_number}', language '{payload.language}'"
-    )
+    logger.info(f"Received synchronous scan trigger request for village '{payload.village_id}'")
 
     try:
-        # Step 1: Geospatial Ingestion
-        paired_data = load_paired_raster_tensors(village_id=payload.village_id)
-        bbox = paired_data.bbox
-
-        # Step 2: Vision Inundation Inference
-        infer_result = run_flood_inference(
-            t1_tensor=paired_data.pre_disaster_tensor,
-            t2_tensor=paired_data.post_disaster_tensor,
+        pipeline_res: PipelineExecutionResult = execute_pipeline(
             village_id=payload.village_id,
-        )
-
-        flooded_ha = round(infer_result.flooded_area_hectares, 2)
-        flood_pct = round(infer_result.flood_percentage, 2)
-
-        # Step 3: Risk Calculation
-        risk_eval = calculate_flood_risk(
-            flooded_hectares=flooded_ha,
-            flood_percentage=flood_pct,
-        )
-
-        # Step 4: Gemini AI Advisory Synthesis
-        advisory_text = advisory_service.generate_advisory(
-            village_id=payload.village_id,
-            flooded_hectares=flooded_ha,
-            flood_percentage=flood_pct,
-            risk_level=risk_eval.risk_level,
+            phone_number=payload.phone_number,
             language=payload.language,
         )
 
-        # Step 5: Twilio SMS Dispatch
-        sms_result = sms_service.send_sms(
-            to_number=payload.phone_number,
-            message_body=advisory_text,
-        )
-
-        pipeline_details = {
-            "bbox": bbox,
-            "inference_mode": infer_result.inference_mode,
-            "flooded_pixels": infer_result.flooded_pixel_count,
-            "total_pixels": infer_result.total_pixel_count,
-            "risk_score": risk_eval.risk_score,
-            "crop_loss_estimate_pct": risk_eval.crop_loss_estimate_pct,
-            "pmfby_claim_recommended": risk_eval.pmfby_claim_recommended,
-            "priority": risk_eval.priority,
-            "sms_delivery": sms_result,
-        }
-
         return ScanTriggerResponse(
             status="success",
-            village_id=payload.village_id,
-            flooded_hectares=flooded_ha,
-            flood_percentage=flood_pct,
-            risk_level=risk_eval.risk_level,
-            advisory_sms=advisory_text,
-            sms_sid=sms_result.get("sms_sid", ""),
-            pipeline_details=pipeline_details,
+            village_id=pipeline_res.village_id,
+            flooded_hectares=pipeline_res.flooded_hectares,
+            flood_percentage=pipeline_res.flood_percentage,
+            risk_level=pipeline_res.risk_level,
+            advisory_sms=pipeline_res.bengali_sms_text,
+            sms_sid=pipeline_res.dispatch_result.get("sms_sid", ""),
+            pipeline_details=pipeline_res.summary(),
         )
 
     except Exception as e:
-        logger.error(f"Error processing scan trigger for village '{payload.village_id}': {e}", exc_info=True)
+        logger.error(f"Error processing synchronous scan trigger: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Pipeline processing failed: {str(e)}"
@@ -222,7 +297,7 @@ async def scan_trigger(payload: ScanTriggerRequest) -> ScanTriggerResponse:
 
 
 # -----------------------------------------------------------------------------
-# 2. GET /api/v1/maps/overlay/{village_id}
+# 5. GET /api/v1/maps/overlay/{village_id} (MapLibre GeoJSON)
 # -----------------------------------------------------------------------------
 
 @app.get(
