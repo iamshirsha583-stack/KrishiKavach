@@ -1,0 +1,1 @@
+"""KrishiKavach Services Package."""

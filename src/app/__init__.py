@@ -1,0 +1,1 @@
+"""KrishiKavach Application Module."""
