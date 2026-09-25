@@ -1,5 +1,6 @@
 """KrishiKavach Geospatial Pipeline Package."""
 
+from src.app.pipeline.geospatial.gee_client import fetch_sar_pair
 from src.app.pipeline.geospatial.ingestion import (
     BoundingBox,
     GeospatialIngestionPipeline,
@@ -10,6 +11,7 @@ from src.app.pipeline.geospatial.ingestion import (
 )
 
 __all__ = [
+    "fetch_sar_pair",
     "BoundingBox",
     "GeospatialIngestionPipeline",
     "PairedRasterData",
@@ -17,3 +19,4 @@ __all__ = [
     "load_paired_raster_tensors",
     "load_village_boundaries",
 ]
+
